@@ -1,0 +1,1146 @@
+<!-- version: 1.5 -->
+<html>
+<head>
+<meta charset="utf-8">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/4.1.3/papaparse.min.js"></script>
+<script src="https://ajax.googleapis.com/ajax/libs/jquery/3.1.1/jquery.min.js"></script>
+<link rel="stylesheet" href="https://ajax.googleapis.com/ajax/libs/jqueryui/1.12.1/themes/smoothness/jquery-ui.css">
+<script src="https://ajax.googleapis.com/ajax/libs/jqueryui/1.12.1/jquery-ui.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/2.4.0/Chart.bundle.min.js"></script>
+<!-- Latest compiled and minified CSS -->
+<link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/css/bootstrap.min.css" integrity="sha384-BVYiiSIFeK1dGmJRAkycuHAHRg32OmUcww7on3RYdg4Va+PmSTsz/K68vbdEjh4u" crossorigin="anonymous">
+<!-- Latest compiled and minified JavaScript -->
+<script src="https://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/js/bootstrap.min.js" integrity="sha384-Tc5IQib027qvyjSMfHjOMaLkfuWVxZxUPnCJA7l2mCWNIpG9mGCD8wGNIcPD7Txa" crossorigin="anonymous"></script>
+
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap-datepicker/1.6.4/css/bootstrap-datepicker3.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap-datepicker/1.6.4/js/bootstrap-datepicker.min.js"></script>
+
+<!--
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dropzone/4.3.0/min/dropzone.min.js"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/dropzone/4.3.0/min/dropzone.min.css">
+-->
+
+<script>
+
+// download from https://www.nordnet.no/mux/web/depa/mindepa/transaktionerNotor.html
+
+var file = "transaktionsfil.csv";
+
+
+var Nordnet = (function() {
+
+    var MATCHING_PRIORITY = {
+        // match transactions by their order size. If nothing was found 
+        // then LAST_BUY matching is followed.
+        ORDER_SIZE: function() { CalcByOrderSize(); },
+                        
+        // match SELL order with whatever last BUY orders are found.
+        LAST_BUY: function() { CalcByLastBuy(); },
+
+        // match SELL order with the oldest BUY orders.
+        OLDEST_BUY: function() { CalcByOldestBuy(); }  
+    },
+
+    _dictionary = {"SALG": "SELL", "KJ�PT": "BUY", "INNSKUDD": "DEPOSIT"},
+
+    _balance = [],
+    _portfolio = [],
+    _transactions = [],
+    _total_profit = 0,
+    _total_fees = 0,
+    _yield = 0,
+    _total_invested = 0,
+
+    round = function(num) {
+        return Number(num.toFixed(2));
+    },
+
+    str2float = function(str) {
+        str = str.replace(/\s/g, '');
+        return round(parseFloat(str.replace(/,/g, '.')));
+    },
+    
+    str2int = function(str) {
+        return parseInt(str.replace(/\s/g, ''));
+    },
+
+    reset = function() {
+        _balance = [];
+        _portfolio = [];
+        _transactions = [];
+        _total_profit = 0;
+        _total_fees = 0;
+        _yield = 0;
+        _total_invested = 0;
+    },
+
+    ParseCSV = function(file, config) {
+        var config = config || {};
+
+        reset();
+
+        Papa.parse(file, {
+            download: config.remote,
+            header: true,
+            encoding: "CP1252", // doesn't seem to help!
+            complete: function(results) {
+                for (var i = 0; i < results.data.length; i++) {
+                    var trx      = results.data[i];
+                    var trx_type = _dictionary[trx["Transaksjonstype"]];
+                    if (trx_type == undefined) {
+                        continue;
+                    }
+
+                    // todo: handle non-NOK transactions
+                    if (trx["Valuta"] != "NOK") {
+                        $("#non-nok-alert").show();
+                        continue;
+                    }
+
+                    if (trx_type == "DEPOSIT") {
+                        _balance.push({
+                            date: trx["Handelsdag"],
+                            amount: str2float(trx["Bel�p"])
+                        });
+                        continue;
+                    }
+
+                    if (trx_type != "SELL" && trx_type != "BUY") {
+                        continue;
+                    }
+
+                    _transactions.push({ 
+                        id: trx["Id"], 
+                        date: trx["Handelsdag"], 
+                        type: trx_type, 
+                        ticker: trx["Verdipapir"], 
+                        shares: str2int(trx["Antall"]), 
+                        price: str2float(trx["Kurs"]), 
+                        fee: str2float(trx["Avgifter"]), 
+                        payment: str2float(trx["Bel�p"]),
+                        refs: [],
+                        profit: trx_type == "SELL" ? str2float(trx["Bel�p"]) : 0,
+                        accounted: trx_type == "SELL" ? str2int(trx["Antall"]) : 0  // was: shares_used
+                    });
+                }
+
+                _balance = _balance.reduceRight(function(accum, deposit) {
+                    if (accum.length == 0) {
+                        accum.push(deposit);
+                    }
+                    else if (accum[accum.length-1].date != deposit.date) {
+                        deposit.amount += accum[accum.length-1].amount;
+                        accum.push(deposit);
+                    }
+                    else {
+                        accum[accum.length-1].amount += deposit.amount;
+                    }
+
+                    return accum;
+                }, []);
+
+                _balance = _balance.reverse();
+
+                config.complete(_transactions);
+            }
+        });
+    },
+
+    FindOrderBySize = function(type, ticker, size, start_index) {
+        start_index = start_index || 0;
+
+        for (var i = start_index; i < _transactions.length; i++) {
+            if (_transactions[i].ticker == ticker && 
+                _transactions[i].type == type && 
+                _transactions[i].shares == size &&
+                _transactions[i].accounted == 0) {
+                return i;
+            }
+        }
+
+        return -1;
+    },
+
+    UpdateYield = function(transaction) {
+        if (transaction.profit == 0)
+            return;
+
+        var sell_date = new Date(Date.parse(transaction.date));
+        var balance = _balance.find(function(deposit) {
+            return sell_date > new Date(Date.parse(deposit.date));
+        });
+
+        _yield += transaction.profit / balance.amount;
+    },
+
+    CreatePortfolio = function() {
+        _portfolio = _transactions.reduce(function(accum, transaction) {
+            if (transaction.type == "BUY" && transaction.accounted != transaction.shares) {
+                var shares = transaction.shares - transaction.accounted;
+                var price = Math.abs(transaction.payment) / transaction.shares;
+                var value = price * shares;
+
+                var found = accum.find(function(entry) {
+                    return entry.ticker == transaction.ticker;
+                });
+                if (found) {
+                    found.shares += shares;
+                    found.value += value;
+                    found.price = found.value / found.shares;
+                    found.lo_price = Math.min(price, found.lo_price);
+                    found.hi_price = Math.max(price, found.hi_price);
+                    found.transactions++;
+                } else {
+                    accum.push({
+                        ticker: transaction.ticker, 
+                        shares: shares, 
+                        value: value,
+                        price: price,
+                        lo_price: price,
+                        hi_price: price,
+                        transactions: 1
+                    });
+                }
+            }
+            return accum;
+        }, []);
+
+        _total_invested = _portfolio.reduce(function(a, b) {
+            return a + b.value;
+        }, 0);
+
+        var cash = (_total_profit + _balance[0].amount) - _total_invested;
+
+        _portfolio.push({
+            ticker: "Cash", 
+            shares: cash.toFixed(0), 
+            value: cash,
+            price: 1,
+            lo_price: 1,
+            hi_price: 1,
+            transactions: 1
+        });
+
+        _total_invested += cash;
+
+        _portfolio.sort(function (a, b) {
+          return b.value - a.value;
+        });
+    },
+
+    CalcOrdersHelper = function(iSell, iBuy) {
+        if (_transactions[iBuy].type != "BUY" || 
+            _transactions[iSell].ticker != _transactions[iBuy].ticker ||
+            _transactions[iBuy].accounted == _transactions[iBuy].shares) {
+            return false;
+        }
+
+        if (_transactions[iSell].accounted <= (_transactions[iBuy].shares - _transactions[iBuy].accounted)) {
+            _transactions[iBuy].accounted += _transactions[iSell].accounted;
+            _transactions[iSell].profit += (_transactions[iBuy].payment / _transactions[iBuy].shares) * _transactions[iSell].accounted;
+            _transactions[iSell].accounted = 0;
+        }
+        else {
+            _transactions[iSell].profit += (_transactions[iBuy].payment / _transactions[iBuy].shares) * (_transactions[iBuy].shares - _transactions[iBuy].accounted);
+            _transactions[iSell].accounted -= (_transactions[iBuy].shares - _transactions[iBuy].accounted);
+            _transactions[iBuy].accounted = _transactions[iBuy].shares;
+        }
+
+        _transactions[iSell].refs.push(iBuy);
+
+        return true;
+    },
+
+    CalcByOrderSize = function() {
+        for (var iSell = 0; iSell < _transactions.length; iSell++) {
+            if (_transactions[iSell].type != "SELL") {
+                continue;
+            }
+
+            var order_matched = FindOrderBySize("BUY", _transactions[iSell].ticker, _transactions[iSell].shares, iSell + 1);
+
+            if (order_matched != -1) {
+                _transactions[order_matched].accounted += _transactions[iSell].shares;
+                _transactions[iSell].profit += _transactions[order_matched].payment;
+                _transactions[iSell].accounted = 0;
+                _transactions[iSell].refs.push(order_matched);
+            }
+            else {
+                for (var iBuy = iSell + 1; iBuy < _transactions.length; iBuy++) {
+                    if (CalcOrdersHelper(iSell, iBuy) == false) {
+                        continue;
+                    }
+
+                    if (_transactions[iSell].accounted == 0) {
+                        break;
+                    }
+                }
+            }
+
+            _total_profit += _transactions[iSell].profit;
+            _total_fees += _transactions[iSell].fee;
+
+            UpdateYield(_transactions[iSell]);
+        }
+    },
+    CalcByLastBuy = function() {
+        for (var iSell = 0; iSell < _transactions.length; iSell++) {
+            if (_transactions[iSell].type != "SELL") {
+                continue;
+            }
+
+            for (var iBuy = iSell + 1; iBuy < _transactions.length; iBuy++) {
+                if (CalcOrdersHelper(iSell, iBuy) == false) {
+                    continue;
+                }
+
+                if (_transactions[iSell].accounted == 0) {
+                    break;
+                }
+            }
+
+            _total_profit += _transactions[iSell].profit;
+            _total_fees += _transactions[iSell].fee;
+
+            UpdateYield(_transactions[iSell]);
+        }
+    },
+    CalcByOldestBuy = function() {
+        for (var iSell = _transactions.length - 1; iSell >= 0; iSell--) {
+            if (_transactions[iSell].type != "SELL") {
+                continue;
+            }
+
+            for (var iBuy = _transactions.length - 1; iBuy >= 0; iBuy--) {
+                if (CalcOrdersHelper(iSell, iBuy) == false) {
+                    continue;
+                }
+
+                if (_transactions[iSell].accounted == 0) {
+                    break;
+                }
+            }
+
+            _total_profit += _transactions[iSell].profit;
+            _total_fees += _transactions[iSell].fee;
+
+            UpdateYield(_transactions[iSell]);
+        }
+    },
+
+    CalculateProfit = function(config) {
+        var config = config || {};
+        var calc_func = config.match_priority || MATCHING_PRIORITY.ORDER_SIZE;
+
+        _total_profit = 0;
+        _total_fees = 0;
+
+        calc_func();
+    },
+
+    GetEarningsByTicker = function() {
+        var earnings = _transactions.reduce(function(accum, transaction) {
+
+            var found = accum.find(function(entry) {
+                return entry.ticker == transaction.ticker;
+            });
+            if (found) {
+                found.earning += transaction.profit;
+
+            }
+            else {
+                accum.push({ticker: transaction.ticker, earning: transaction.profit});    
+            }
+
+            return accum;
+        }, []);
+
+        earnings.sort(function (a, b) {
+          return b.earning - a.earning;
+        });
+
+        return earnings;
+    },
+
+
+    ui = {
+
+        _elements: {
+            table: $("#transactions-tbl > tbody"),
+            trx_type: $("#transaction-type"),
+            ticker_list: $("#ticker-list"),
+            from_date: $('#fromMonth'),
+            to_date: $('#toMonth'),
+        },
+
+        _ticker_list: [],
+        _profit: 0,
+        _fees: 0,
+        _count: 0,
+        _inout: 0,
+
+        reset: function() {
+            this._ticker_list = [];
+            this._profit = 0;
+            this._fees = 0;
+            this._count = 0;
+            this._inout = 0;
+        },
+
+        bind_ui: function(elements) {
+            this._elements = elements;
+        },
+
+        numberWithCommas(x) {
+            return x.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+        },
+
+        draw_table: function(from_year, from_month, to_year, to_month) {
+            this._elements.table.empty();
+            this.reset();
+
+            var transactions = _transactions;
+            var selected_type = this._elements.trx_type.val();
+            var selected_tick = this._elements.ticker_list.val();
+            if (from_year === undefined) {
+                var date = this._elements.from_date.val().split('/');
+                from_year = parseInt(date[1]);
+                from_month = parseInt(date[0]) - 1;
+            }
+            if (to_year === undefined) {
+                var date = this._elements.to_date.val().split('/');
+                to_year = parseInt(date[1]);
+                to_month = parseInt(date[0]) - 1;
+            }
+
+            for (var i = 0; i < transactions.length; i++) {
+                if ((selected_type != "ALL" && transactions[i].type != selected_type) ||
+                    (selected_tick != "ALL" && transactions[i].ticker != selected_tick)) {
+                    continue;
+                }
+
+                var d = new Date(Date.parse(transactions[i].date));
+                if (d.getFullYear() < from_year || d.getFullYear() > to_year)
+                    continue;
+                if (d.getFullYear() == from_year && d.getMonth() < from_month)
+                    continue
+                if (d.getFullYear() == to_year && d.getMonth() > to_month)
+                    continue
+
+                this._profit += transactions[i].profit;
+                this._fees += transactions[i].fee;
+                this._count++;
+                this._inout += Math.abs(transactions[i].payment);
+
+                this.draw_transaction(transactions[i], i);
+
+                if (this._ticker_list.indexOf(transactions[i].ticker) === -1) {
+                    this._ticker_list.push(transactions[i].ticker);
+                }  
+            }
+
+            this.draw_table_summary();
+
+
+            $('option', this._elements.ticker_list).not(':eq(0)').remove();
+            var self = this;
+            $.each(this._ticker_list, function() {
+                self._elements.ticker_list.append($("<option />").text(this));
+            });
+            this._elements.ticker_list.val(selected_tick);
+        },
+
+        draw_transaction: function(transaction, num) {
+            var row = $('<tr>').appendTo(this._elements.table);
+            $(row).hover(function() {
+                $(this).addClass('hover-tr');
+            }, function() {
+                $(this).removeClass('hover-tr');
+            });
+            var self = this;
+
+            $('<td>').appendTo($(row)).append(num);
+            $('<td>').appendTo($(row)).append(transaction.date);
+            $('<td>').appendTo($(row)).append(transaction.type).addClass(transaction.type);
+            $('<td>').appendTo($(row)).append(transaction.ticker);
+            $('<td>').appendTo($(row)).append(transaction.shares);
+            $('<td>').appendTo($(row)).append(transaction.price);
+            $('<td>').appendTo($(row)).append(round(transaction.fee));
+            $('<td>').appendTo($(row)).append(transaction.payment);
+            $('<td>').appendTo($(row)).append(transaction.refs.join()).hover(
+                function() {
+                    var refs = $(this).text().split(",");
+                    if (refs.length == 0)
+                        return;
+                    //$(this).parent().addClass('hover-tr');
+                    self._elements.table.children('tr').each(function() {
+                        if (refs.indexOf($(this).children(':first').text()) != -1) {
+                            $(this).addClass('hover-refs');
+                        };
+                    });
+                }, function() {
+                    var refs = $(this).text().split(",");
+                    if (refs.length == 0)
+                        return;
+                    //$(this).parent().removeClass('hover-tr');
+                    self._elements.table.children('tr').each(function() {
+                        if (refs.indexOf($(this).children(':first').text()) != -1) {
+                            $(this).removeClass('hover-refs');
+                        };
+                    });
+                }
+            );
+            $('<td>').appendTo($(row)).append(transaction.accounted).addClass(function() {
+                var cls = "center";
+                if (transaction.type == "SELL" && transaction.accounted != 0) {
+                    cls += ' error';
+                    $("#data-incomplete-alert").show();
+                } else if (transaction.type == "BUY" && transaction.accounted != transaction.shares) {
+                    cls += ' current-portfolio';
+                }
+                return cls
+            });
+            $('<td>').appendTo($(row))
+                .append(this.numberWithCommas(round(transaction.profit)))
+                .addClass(transaction.profit >= 0 ? 'profit' : 'loss');
+        },
+
+        draw_table_summary: function() {
+            var row = $('<tr>').appendTo(this._elements.table);
+            var self = this;
+
+            $(this._elements.table).prev().find('th').each(function(index) {
+                var cell = $('<td>').appendTo($(row));
+                if (index == 0) {
+                    $(cell).append("Total").addClass('bold');
+                }
+                else if (index == 1) {
+                    $(cell).append(self._count).addClass('bold');
+                }
+                else if (index == 6) {
+                    $(cell).append(self.numberWithCommas(round(self._fees))).addClass('bold');
+                }
+                else if (index == 7) {
+                    $(cell).append(self.numberWithCommas(round(self._inout))).addClass('bold');
+                }
+                else if (index == 10) {
+                    $(cell).append(self.numberWithCommas(round(self._profit)));
+                    $(cell).addClass(self._profit >= 0 ? 'profit' : 'loss');
+                }
+            });
+        },
+
+        draw_portfolio: function() {
+            $("#portfolio-tbl > tbody").empty();
+            for (var i = 0; i < _portfolio.length; i++) {
+                var row = $('<tr>').appendTo("#portfolio-tbl > tbody");
+                $('<td>').appendTo($(row)).append(i+1);
+                $('<td>').appendTo($(row)).append(_portfolio[i].ticker).addClass('bold');
+                $('<td>').appendTo($(row)).append(this.numberWithCommas(_portfolio[i].shares));
+                $('<td>').appendTo($(row)).append(_portfolio[i].transactions);
+                $('<td>').appendTo($(row)).append(_portfolio[i].lo_price.toFixed(2));
+                $('<td>').appendTo($(row)).append(_portfolio[i].hi_price.toFixed(2));
+                $('<td>').appendTo($(row)).append(_portfolio[i].price.toFixed(2)).addClass('bold');
+                $('<td>').appendTo($(row)).append(((_portfolio[i].value / _total_invested) * 100).toFixed(1) + "%");
+                $('<td>').appendTo($(row)).append(this.numberWithCommas((_portfolio[i].value).toFixed(0))).addClass('bold');
+            }
+            var row = $('<tr>').appendTo("#portfolio-tbl > tbody");
+            $('<td>').appendTo($(row)).append("Total").addClass('bold');
+            $('<td><td><td><td><td><td><td>').appendTo($(row));
+            $('<td>').appendTo($(row)).append(this.numberWithCommas(_total_invested.toFixed(0))).addClass('bold');
+        },
+
+        draw_total_profit: function() {
+            // todo: bind_ui
+            $('.profit-box h1').text(this.numberWithCommas(Math.round(_total_profit)) + " NOK");
+            $('.yield h4').text((_yield * 100).toFixed(2) + "%  (" + ((_total_profit / _balance[0].amount) * 100).toFixed(2) + "%)");
+            $('.deposits h4').text(this.numberWithCommas(_balance[0].amount) + " NOK");
+        },
+
+        chart_data: function() {
+            var data = _transactions.reduce(function(accum, transaction) {
+                var d = new Date(Date.parse(transaction.date));
+                var month = "" + (d.getMonth() + 1) + "/" + d.getFullYear();
+                
+                if (accum.months.length == 0 || accum.months[accum.months.length-1] != month) {
+                    accum.months.push(month);
+                    accum.profit.push(0);
+                    accum.transactions.push(0);
+                }
+                accum.profit[accum.months.length-1] += transaction.profit;
+                accum.transactions[accum.months.length-1]++;
+
+                return accum;
+
+            }, { months: [], profit: [], transactions: [] });
+
+            data.profit = data.profit.map(round);
+
+            return data;
+        },
+
+        earnings_chart_: undefined,
+
+        draw_earnings_chart: function() {
+            if (this.earnings_chart_) {
+                this.earnings_chart_.destroy();
+            }
+
+            var earnings = GetEarningsByTicker();
+
+            var data = {
+                labels: earnings.map(function(obj) { return obj.ticker; }).slice(0, 10),
+                datasets: [
+                    {
+                        label: "Earnings By Instrument (Top 10)",
+                        backgroundColor: [
+                            'rgba(54, 162, 235, 0.8)',
+                            'rgba(255, 206, 86, 0.8)',
+                            'rgba(75, 192, 192, 0.8)',
+                            'rgba(153, 102, 255, 0.8)',
+                            'rgba(255, 99, 132, 0.8)',
+                            'rgba(255, 159, 64, 0.8)',
+                            'rgba(60, 182, 242, 0.8)',
+                            'rgba(90, 210, 219, 0.8)',
+                            'rgba(128, 89, 128, 0.8)',
+                            'rgba(224, 129, 99, 0.8)',
+                        ],
+                        borderWidth: 1,
+                        data: earnings.map(function(obj) { return round(obj.earning); }).slice(0, 10),
+                    }
+                ]
+            };
+
+            var ctx = $("#earnings-inst-chart");
+
+            this.earnings_chart_ = new Chart(ctx, {
+                type: 'bar',
+                data: data,
+                options: {
+                    scales: {
+                        xAxes: [{
+                            stacked: true
+                        }],
+                        yAxes: [{
+                            stacked: true
+                        }]
+                    }
+                }
+            });
+        },
+
+        profit_month_chart_: undefined,
+
+        draw_profit_month_chart: function(data) {
+            if (this.profit_month_chart_) {
+                this.profit_month_chart_.destroy();
+            }
+            var ctx = $("#chart");
+            var config = {
+                type: 'line',
+                data: {
+                    labels: data.months.reverse().slice(0,12),
+                    datasets: [{
+                        label: "Profit",
+                        backgroundColor: window.chartColors.blue,
+                        borderColor: window.chartColors.blue,
+                        yAxisID: 'profitY',
+                        data: data.profit.reverse().slice(0,12),
+                        fill: false,
+                    }, {
+                        label: "# of transactions",
+                        fill: false,
+                        backgroundColor: window.chartColors.red,
+                        borderColor: window.chartColors.red,
+                        yAxisID: 'transactionsY',
+                        data: data.transactions.reverse().slice(0,12),
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    title:{
+                        display:true,
+                        text:'Profit Over The Last 12 Months'
+                    },
+                    tooltips: {
+                        mode: 'index',
+                        intersect: false,
+                    },
+                    hover: {
+                        mode: 'nearest',
+                        intersect: true
+                    },
+                    scales: {
+                        xAxes: [{
+                            display: true
+                        }],
+                        yAxes: [{
+                            id: 'profitY',
+                            position: 'left',
+                            display: true,
+                            scaleLabel: {
+                                display: true,
+                                labelString: 'Profit'
+                            }
+                        },
+                        {
+                            id: 'transactionsY',
+                            position: 'right',
+                            display: true,
+                            scaleLabel: {
+                                display: true,
+                                labelString: '# of Transactions'
+                            }
+                        }]
+                    }
+                }
+            };
+
+            this.profit_month_chart_ = new Chart(ctx, config);
+        },
+
+        show: function(options) {
+            var options = options || {};
+
+            if (options.transactions) {
+                this.draw_table(options.from_year, options.from_month, options.to_year, options.to_month);
+            }
+            if (options.portfolio) {
+                this.draw_portfolio();    
+            }
+            if (options.profit) {
+                this.draw_total_profit();    
+            }
+            if (options.profit_chart) {
+                this.draw_profit_month_chart(this.chart_data());
+            }
+            if (options.earnings_chart) {
+                this.draw_earnings_chart();
+            }
+        }
+
+    };  // ui {}
+
+
+    return {
+        MATCHING_PRIORITY: MATCHING_PRIORITY,
+        ParseCSV: ParseCSV,
+        CalculateProfit: CalculateProfit,
+        CreatePortfolio: CreatePortfolio,
+        bind_ui: ui.bind_ui.bind(ui),
+        show: ui.show.bind(ui)
+    };
+
+}());
+
+
+
+
+$(function() {
+
+    window.chartColors = {
+        red: 'rgb(255, 99, 132)',
+        orange: 'rgb(255, 159, 64)',
+        yellow: 'rgb(255, 205, 86)',
+        green: 'rgb(75, 192, 192)',
+        blue: 'rgb(54, 162, 235)',
+        purple: 'rgb(153, 102, 255)',
+        grey: 'rgb(231,233,237)'
+    };
+
+    Nordnet.bind_ui({
+        table: $("#transactions-tbl > tbody"),
+        trx_type: $("#transaction-type"),
+        ticker_list: $("#ticker-list"),
+        from_date: $('#fromMonth'),
+        to_date: $('#toMonth')
+    });
+
+    $("#transaction-type").change(function() {
+        Nordnet.show({
+            transactions: true,
+        });
+    });
+
+    $("#ticker-list").change(function() {
+        Nordnet.show({
+            transactions: true,
+        });
+    });
+
+    $("#match-by").change(function() {
+        var match_by = Nordnet.MATCHING_PRIORITY.ORDER_SIZE;
+        if ($(this).val() == "Last Buy") {
+            match_by = Nordnet.MATCHING_PRIORITY.LAST_BUY;
+        }
+        else if ($(this).val() == "Oldest Buy") {
+            match_by = Nordnet.MATCHING_PRIORITY.OLDEST_BUY;
+        }
+
+        Nordnet.ParseCSV(file, {
+            remote: true,
+            complete: function() {
+                Nordnet.CalculateProfit({
+                    match_priority: match_by
+                });
+
+                Nordnet.CreatePortfolio();
+
+                Nordnet.show({
+                    transactions: true,
+                    portfolio: true,
+                    profit: true,
+                    profit_chart: true,
+                    earnings_chart: true
+                });
+            }
+        });
+    });
+
+    Nordnet.ParseCSV(file, {
+        remote: true,
+        complete: function() {
+            Nordnet.CalculateProfit({
+                match_priority: Nordnet.MATCHING_PRIORITY.ORDER_SIZE
+            });
+
+            Nordnet.CreatePortfolio();
+
+            var today = new Date();
+
+            Nordnet.show({
+                transactions: true,
+                portfolio: true,
+                profit: true,
+                profit_chart: true,
+                earnings_chart: true,
+                from_year: today.getFullYear(),
+                from_month: today.getMonth()
+            });
+        }
+    });
+
+
+    // todo: use input-range from bootstrap-datepicker instead of two separate inputs.
+    $('.date-picker').datepicker( {
+        format: "mm/yyyy",
+        startView: 1,
+        minViewMode: 1,
+        autoclose: true,
+        todayBtn: "linked",
+    })
+//    .change(dateChanged)
+    .on('changeDate', dateChanged);
+
+    var today = new Date();
+    $('.date-picker').datepicker('setDate', new Date(today.getFullYear(), today.getMonth(), 1));
+
+    function dateChanged(ev) {
+        if ($(this).attr('id') == "fromMonth") {
+            Nordnet.show({
+                transactions: true,
+                from_year: ev.date.getFullYear(),
+                from_month: ev.date.getMonth()
+            });
+        } else {
+            Nordnet.show({
+                transactions: true,
+                to_year: ev.date.getFullYear(),
+                to_month: ev.date.getMonth()
+            });
+        }
+    }
+    
+
+
+
+    var datepicker = $.fn.datepicker.noConflict();
+    $.fn.bootstrapDP = datepicker;
+
+});
+
+</script>
+    
+
+<style>
+
+table, td {
+    border: 1px solid black;
+}
+td { white-space:pre }
+
+.profit { color: blue; font-weight: bold; }
+.loss { color: red; font-weight: bold; }
+.sell { color: green; }
+.buy { color: red; }
+.current-portfolio { color: orange; }
+.current-portfolio::after { 
+    content: " - [Pf]";
+}
+
+.error { color: red; font-weight: bold; }
+.error::after { 
+    content: " - [ERR]";
+}
+
+.center {
+    text-align: center;
+}
+
+.bold {
+    font-weight: bold; 
+}
+
+.hover-tr {
+    background-color: #F0E68C !important;
+}
+.hover-refs {
+    background-color: #98FB98 !important;
+}
+
+.date-picker {
+    width: 5.5em;
+    margin-right: 2px !important;
+}
+
+.ui-datepicker-calendar {
+    display: none;
+}
+
+#left-section { 
+  width: 52%; 
+  float:left; 
+  margin-left: 1%; 
+  margin-right: 2%; 
+  margin-top: 10px;
+}
+#right-section { 
+  width: 44%; 
+  float:left 
+  
+}
+
+#left-section select {
+  margin-right: 20px;
+}
+
+
+/*
+ https://jsfiddle.net/gqq7poje/1/ 
+*/
+.profit-box {
+    height: 40%;
+    width: 80%;
+    margin: 30px auto; 
+    background-color: #aaa;
+    color: white;
+    text-align: center;
+}
+
+.profit-box .profit-big {
+    font-size: 0px; /*Remove extra margins!*/
+    margin-left: auto;
+    margin-right: auto;
+    height: 70%;
+}
+
+.profit-box h1 {
+    position: relative;
+    top: 35%; /* todo: fix it be vertically centered. */
+    height: 30%;
+    margin: 0 auto; 
+    font-size: 60px;
+}
+
+.profit-box .yield-box {
+    font-size: 0px; /*Remove extra margins!*/
+    height: 30%;
+    margin-left:auto;
+    margin-right:auto;
+    border-top: 1px solid #ddd;
+}
+
+.profit-box .yield {
+    display:inline-block;
+    width: 48%;
+    height: 100%;
+    font-size: 30px;
+    border-right: 1px solid #ddd;
+}
+
+.profit-box .deposits {
+    display:inline-block;
+    width: 48%;
+    height: 100%;
+    font-size: 30px;
+}
+
+.profit-box h4 {
+    position: relative;
+    top: 40%;
+    margin: 0 auto; 
+}
+
+#portfolio-tbl {
+    margin-bottom: 25px;
+    width: 100%;
+}
+
+#transactions-tbl {
+    width: 100%;
+}
+
+
+.tab-content {
+    border-left: 1px solid #ddd;
+    border-right: 1px solid #ddd;
+    padding: 5px;
+}
+
+.nav-tabs {
+    margin-bottom: 0;
+}
+
+</style>
+</head>
+<body>
+
+<div class="alert alert-warning alert-dismissible" role="alert" id="non-nok-alert" style="display:none;">
+    <button type="button" class="close" data-dismiss="alert" aria-label="Close">
+    <span aria-hidden="true">&times;</span></button>
+    Found a transaction with a currency other than NOK - will be ignored!
+</div>
+
+<div class="alert alert-danger alert-dismissible" role="alert" id="data-incomplete-alert" style="display:none;">
+    <button type="button" class="close" data-dismiss="alert" aria-label="Close">
+    <span aria-hidden="true">&times;</span></button>
+    Missing data - failed to match all SELL orders with corrosponding BUY orders!
+</div>
+
+<div id="left-section">
+
+  <!-- Nav tabs -->
+  <ul class="nav nav-tabs" role="tablist">
+    <li role="presentation" class="active"><a href="#transactions" aria-controls="transactions" role="tab" data-toggle="tab">Transactions</a></li>
+    <li role="presentation"><a href="#portfolio" aria-controls="portfolio" role="tab" data-toggle="tab">Portfolio</a></li>
+    <li role="presentation"><a href="#earnings" aria-controls="earnings" role="tab" data-toggle="tab">Earnings</a></li>
+  </ul>
+
+  <!-- Tab panes -->
+  <div class="tab-content">
+    <div role="tabpanel" class="tab-pane active" id="transactions">
+    <!-- 
+    background-color: #e3e3e3;
+    background-color: #f5f3f3;
+    -->
+      <div>
+        <form class="form-inline">
+            <div class="form-group">
+                <div class="form-group">
+                    <div class="input-group" style="width: 280px;">
+                      <span class="input-group-addon">Month</span>
+                      <input name="fromMonth" id="fromMonth" class="date-picker form-control" />
+                      <span class="input-group-addon">-</span>
+                      <input name="toMonth" id="toMonth" class="date-picker form-control" />
+                    </div>
+                </div>
+                <div class="form-group">
+                    <div class="input-group" style="width: 140px;">
+                      <span class="input-group-addon">Type</span>
+                      <select name="transaction-type" id="transaction-type" class="form-control">
+                        <option selected="selected">ALL</option>
+                        <option>SELL</option>
+                        <option>BUY</option>
+                      </select>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <div class="input-group" style="width: 190px;">
+                      <span class="input-group-addon">Ticker</span>
+                      <select name="ticker-list" id="ticker-list" class="form-control">
+                        <option selected="selected">ALL</option>
+                      </select>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <div class="input-group" style="width: 180px;">
+                      <span class="input-group-addon">Match</span>
+                      <select name="match-by" id="match-by" class="form-control">
+                        <option selected="selected">Order Size</option>
+                        <option>Last Buy</option>
+                        <option>Oldest Buy</option>
+                      </select>
+                    </div>
+                </div>
+            </div>
+        </form>
+      </div>
+
+      <table class="table-striped table-bordered table-condensed" id="transactions-tbl">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Date</th>
+            <th>Type</th>
+            <th>Ticker</th>
+            <th>Shares</th>
+            <th>Price</th>
+            <th>Fee</th>
+            <th>Payment</th>
+            <th>Refs</th>
+            <th>Accounted</th>
+            <th>Profit</th>
+          </tr>
+        </thead>
+        <tbody>
+        </tbody>
+      </table>
+
+    </div>
+
+    <div role="tabpanel" class="tab-pane" id="portfolio">
+      <!-- Table -->
+      <table class="table-striped table-bordered table-condensed" id="portfolio-tbl">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Ticker</th>
+            <th>Shares</th>
+            <th># Trxs</th>
+            <th>Low</th>
+            <th>High</th>
+            <th>Price</th>
+            <th>%</th>
+            <th>Value</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div role="tabpanel" class="tab-pane" id="earnings">
+        <canvas id="earnings-inst-chart"></canvas>
+    </div>
+  </div>
+
+
+
+</div>
+
+<div id="right-section">
+    <canvas id="chart"></canvas>
+
+    <div class="profit-box">
+        <div class="profit-big">
+            <h1></h1>
+        </div>
+        <div class="yield-box">
+            <div class="yield"><h4></h4></div>
+            <div class="deposits"><h4></h4></div>
+        </div>
+    </div>
+</div>
+
+
+</body>
+</html>
